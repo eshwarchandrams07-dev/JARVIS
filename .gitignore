@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+.jarvis_chrome_profile/
+.jarvis_memory.json
+.jarvis_memory.json.tmp
+Jarvis_Notes.txt
+.env
