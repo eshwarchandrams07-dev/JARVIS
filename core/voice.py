@@ -253,15 +253,55 @@ class VoiceEngine:
                 # Slower, warmer weight on opening greeting/interjection + natural breath pause
                 chunks.append((clean_part, 0.88, 0.14))
             elif has_emphasis and word_count <= 10:
-                chunks.append((clean_part, 0.94, 0.12))
+                chunks.append((clean_part, 0.94, 0.14))
             elif clean_part.endswith('?'):
-                chunks.append((clean_part, 0.98, 0.16))
+                chunks.append((clean_part, 0.98, 0.20))
             elif clean_part.endswith('!'):
-                chunks.append((clean_part, 1.04, 0.14))
+                chunks.append((clean_part, 1.03, 0.18))
+            elif clean_part.endswith('.'):
+                # Declarative full-stop sentence: gently relaxed pace + fuller breath pause
+                chunks.append((clean_part, 0.95, 0.26))
             else:
-                chunks.append((clean_part, 1.02, 0.12))
+                chunks.append((clean_part, 1.00, 0.16))
 
         return chunks
+
+    @staticmethod
+    def _shape_phrase_envelope(samples: np.ndarray, sr_hz: int, soft_ending: bool) -> np.ndarray:
+        """
+        Trim dead leading silence cleanly while keeping natural trailing breath,
+        and apply a gentle cosine volume decrease before full stops ('.') instead of an abrupt cut.
+        """
+        if len(samples) == 0:
+            return samples
+        voiced = np.where(np.abs(samples) > 0.003)[0]
+        if len(voiced) == 0:
+            return samples
+
+        lead_pad = int(0.012 * sr_hz)
+        tail_pad = int(0.090 * sr_hz) if soft_ending else int(0.050 * sr_hz)
+        start = max(0, int(voiced[0]) - lead_pad)
+        end = min(len(samples), int(voiced[-1]) + tail_pad)
+        out = samples[start:end].astype(np.float32, copy=True)
+
+        # Tiny 8ms fade-in to avoid any start click
+        fade_in_n = min(int(0.008 * sr_hz), len(out) // 4)
+        if fade_in_n > 0:
+            out[:fade_in_n] *= np.linspace(0.0, 1.0, fade_in_n, dtype=np.float32)
+
+        if soft_ending and len(out) > int(0.30 * sr_hz):
+            # Gradually decrease volume over the final ~260ms of speech + breath tail (1.0 -> 0.0)
+            fade_n = min(int(0.26 * sr_hz), int(len(out) * 0.45))
+            t = np.linspace(0.0, np.pi / 2.0, fade_n, dtype=np.float64)
+            curve = (np.clip(np.cos(t), 0.0, 1.0) ** 1.4).astype(np.float32)
+            out[-fade_n:] *= curve
+        else:
+            # Smooth 35ms micro-release so non-period chunks never hard-click
+            fade_n = min(int(0.035 * sr_hz), len(out) // 4)
+            if fade_n > 0:
+                out[-fade_n:] *= np.linspace(1.0, 0.0, fade_n, dtype=np.float32)
+
+        return out
 
     def _base_kokoro_speed(self) -> float:
         """Convert WPM-style or multiplier rate cleanly into Kokoro speed (0.65..1.45)."""
@@ -287,33 +327,60 @@ class VoiceEngine:
         def _synth(idx: int):
             chunk_text, mult, pause_s = chunks[idx]
             spd = max(0.65, min(1.5, base_speed * mult))
+            is_period = chunk_text.endswith(".") and not chunk_text.endswith("...")
             samples, sr_hz = kokoro.create(
                 chunk_text,
                 voice=voice_id,
                 speed=spd,
                 lang=lang,
-                sentence_pause=0.18,
-                clause_pause=0.08,
+                trim=False,
+                sentence_pause=0.22,
+                clause_pause=0.10,
             )
+            samples = self._shape_phrase_envelope(samples, sr_hz, soft_ending=is_period)
             if pause_s > 0 and idx < len(chunks) - 1:
                 silence = np.zeros(int(pause_s * sr_hz), dtype=samples.dtype)
+                samples = np.concatenate([samples, silence])
+            elif idx == len(chunks) - 1:
+                # 60ms soft tail pad so macOS CoreAudio doesn't clip the final faded decay
+                silence = np.zeros(int(0.06 * sr_hz), dtype=samples.dtype)
                 samples = np.concatenate([samples, silence])
             return samples, sr_hz
 
         try:
             with ThreadPoolExecutor(max_workers=1) as pool:
                 next_future = pool.submit(_synth, 0)
-                for idx in range(len(chunks)):
-                    with self._gen_lock:
-                        if gen != self._speech_gen:
-                            return True
-                    samples, sr_hz = next_future.result()
-                    if idx + 1 < len(chunks):
-                        next_future = pool.submit(_synth, idx + 1)
-                    with self._gen_lock:
-                        if gen != self._speech_gen:
-                            return True
-                    sd.play(samples, sr_hz, blocking=True)
+                stream = None
+                try:
+                    for idx in range(len(chunks)):
+                        with self._gen_lock:
+                            if gen != self._speech_gen:
+                                return True
+                        samples, sr_hz = next_future.result()
+                        if idx + 1 < len(chunks):
+                            next_future = pool.submit(_synth, idx + 1)
+                        with self._gen_lock:
+                            if gen != self._speech_gen:
+                                return True
+                        if stream is None:
+                            stream = sd.OutputStream(samplerate=sr_hz, channels=1, dtype="float32")
+                            stream.start()
+                        # Write in 2048-sample slices so voice.stop() interrupts within ~85ms
+                        pos = 0
+                        while pos < len(samples):
+                            with self._gen_lock:
+                                if gen != self._speech_gen:
+                                    stream.abort()
+                                    return True
+                            stream.write(samples[pos:pos + 2048].reshape(-1, 1))
+                            pos += 2048
+                finally:
+                    if stream is not None:
+                        try:
+                            stream.stop()
+                            stream.close()
+                        except Exception:
+                            pass
             return True
         except Exception:
             return False
