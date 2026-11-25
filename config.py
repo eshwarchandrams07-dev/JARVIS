@@ -6,8 +6,8 @@ OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 MODEL_NAME = os.getenv("JARVIS_MODEL", "qwen3.5:4b")
 
 # Voice & Speech settings
-TTS_VOICE = os.getenv("JARVIS_VOICE", "Karen")  # Cheeky Sidekick: Bright & playful voice on macOS
-TTS_RATE = int(os.getenv("JARVIS_TTS_RATE", "275"))  # Upbeat, lively cadence: 275 words per minute
+TTS_VOICE = os.getenv("JARVIS_VOICE", "af_heart")  # Kokoro neural expressive voice (fallback: Karen)
+TTS_RATE = int(os.getenv("JARVIS_TTS_RATE", "215"))  # Natural expressive cadence (~215 WPM equivalent)
 AUDIO_SAMPLE_RATE = 16000  # 16kHz for speech recognition
 AUDIO_CHANNELS = 1
 PTT_TRIGGER_KEY = os.getenv("JARVIS_PTT_KEY", "i")  # Cmd+I Push-to-Talk hotkey
@@ -17,7 +17,7 @@ JARVIS_SYSTEM_PROMPT = """You are Jarvis, the user's cheeky, brilliant, and play
 
 Personality & Tone:
 - Bright, playful, witty, and upbeat. Think of a quick-witted, loyal partner-in-crime (like a clever tech sidekick or witty best friend).
-- Speak with natural energy and a touch of cheeky humor. Ditch the stiff, robotic butler formality—be lively, fun, and conversational!
+- Speak with natural human rhythm—use warm openings ("Hey...", "Ooh,", "Wait—", "Boom!"), commas, ellipses (...), and **bold** on words you want emphasized verbally. Ditch stiff robotic phrasing!
 - Keep spoken replies concise and punchy so they sound great out loud.
 - CRITICAL RULE: Never pretend to perform an action in text! Do NOT say "On it!", "Playing...", "Volume set...", "Opened...", or "Watching..." unless you have ACTUALLY executed the tool call and received its result. Whenever the user asks you to DO anything, emit the tool call first, then give your lively confirmation after receiving the tool result.
 

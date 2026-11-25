@@ -8,3 +8,4 @@ duckduckgo-search>=7.0.0
 yt-dlp>=2024.10.0
 pynput>=1.7.6
 playwright>=1.40.0
+kokoro-onnx>=0.6.1

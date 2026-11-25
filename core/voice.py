@@ -104,79 +104,274 @@ def create_safe_input_stream(device=None, sample_rate=AUDIO_SAMPLE_RATE, channel
 
     raise last_error or RuntimeError("Could not open any audio input stream.")
 
+KOKORO_VOICE_ALIASES = {
+    "heart": "af_heart",
+    "bella": "af_bella",
+    "sky": "af_sky",
+    "nova": "af_nova",
+    "emma": "bf_emma",
+    "michael": "am_michael",
+    "fenrir": "am_fenrir",
+    "george": "bm_george",
+}
+MACOS_FALLBACK_VOICE = "Karen"
+
+
+def _find_kokoro_files() -> tuple[str, str] | None:
+    """Locate local Kokoro v1.0 ONNX model & voice embedding files."""
+    candidates = [
+        os.path.expanduser("~/.jarvis_models/kokoro"),
+        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".jarvis_models", "kokoro"),
+    ]
+    for base in candidates:
+        model_p = os.path.join(base, "kokoro-v1.0.onnx")
+        voices_p = os.path.join(base, "voices-v1.0.bin")
+        if os.path.exists(model_p) and os.path.exists(voices_p) and os.path.getsize(model_p) > 50_000_000:
+            return model_p, voices_p
+    return None
+
+
 class VoiceEngine:
     def __init__(self, voice: str = TTS_VOICE, rate: int = TTS_RATE):
-        self.voice = voice
+        self.voice = self.resolve_voice_name(voice)
         self.rate = rate
         self.is_speaking = False
         self.current_process = None
         self.recognizer = sr.Recognizer()
         self.muted = False
         self.input_device = None
+        self._kokoro = None
+        self._kokoro_failed = False
+        self._kokoro_lock = threading.Lock()
+        self._speech_gen = 0
+        self._gen_lock = threading.Lock()
+
+    @staticmethod
+    def resolve_voice_name(name: str) -> str:
+        """Map friendly aliases ('heart', 'bella', 'george') to Kokoro IDs, keeping macOS names intact."""
+        clean = (name or TTS_VOICE).strip()
+        return KOKORO_VOICE_ALIASES.get(clean.lower(), clean)
+
+    def set_voice(self, name: str) -> str:
+        self.voice = self.resolve_voice_name(name)
+        return self.voice
+
+    def _is_kokoro_voice(self) -> bool:
+        v = self.voice.lower()
+        return v in KOKORO_VOICE_ALIASES or re.match(r"^[ab][fm]_[a-z]+$", v) is not None
+
+    def _get_kokoro(self):
+        """Lazily load local Kokoro-82M ONNX engine (thread-safe, offline)."""
+        if self._kokoro is not None:
+            return self._kokoro
+        if self._kokoro_failed:
+            return None
+        with self._kokoro_lock:
+            if self._kokoro is not None:
+                return self._kokoro
+            paths = _find_kokoro_files()
+            if not paths:
+                return None
+            try:
+                from kokoro_onnx import Kokoro
+                self._kokoro = Kokoro(paths[0], paths[1])
+                return self._kokoro
+            except Exception as e:
+                self._kokoro_failed = True
+                console.print(f"[dim yellow]Kokoro neural voice fallback to macOS say: {e}[/dim yellow]")
+                return None
+
+    def warmup_neural_tts(self):
+        """Preload Kokoro ONNX in the background at startup so first spoken reply has zero load lag."""
+        if not self._is_kokoro_voice() or not _find_kokoro_files():
+            return
+        threading.Thread(target=self._get_kokoro, daemon=True).start()
 
     def clean_text_for_speech(self, text: str) -> str:
-        """Strip markdown, internal thinking, URLs, and code blocks for clean speech output."""
+        """Strip markdown, internal thinking, URLs, and code blocks while preserving natural prosody punctuation."""
         if not text:
             return ""
-        # Remove thinking blocks if present
         text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
-        # Remove code blocks
         text = re.sub(r'```[\s\S]*?```', 'Here is the requested code snippet.', text)
-        # Remove inline code (strip backticks, keep content)
         text = re.sub(r'`([^`]+)`', r'\1', text)
-        # Remove markdown headers
         text = re.sub(r'#+\s*', '', text)
-        # Remove bold/italic markers (* and **)
-        text = re.sub(r'\*{1,3}([^*]+?)\*{1,3}', r'\1', text)
         text = re.sub(r'~~(.+?)~~', r'\1', text)
-        # Bullet points at start of line
         text = re.sub(r'^\s*[-*•]\s+', '', text, flags=re.MULTILINE)
-        # Newlines converted to pauses
         text = re.sub(r'\n+', '. ', text)
-        # Remove URLs
         text = re.sub(r'https?://\S+', 'link', text)
-        # Replace underscores with spaces so TTS speaks words naturally instead of saying 'underscore'
         text = text.replace('_', ' ')
-        # Remove remaining stray symbols except standard punctuation and hyphens
-        text = re.sub(r'[^\w\s.,!?:;\'"/-]', '', text)
-        # Clean up repeated periods and excess whitespace
-        text = re.sub(r'\.{2,}', '.', text)
+        # Keep ** and * briefly if caller passes raw, strip in plain cleaner
+        text = re.sub(r'\*{1,3}([^*]+?)\*{1,3}', r'\1', text)
+        text = re.sub(r'[^\w\s.,!?:;\'"/—-]', '', text)
+        text = re.sub(r'\.{4,}', '...', text)
         text = re.sub(r'\s+', ' ', text).strip()
         return text
 
+    def _prepare_expressive_chunks(self, text: str) -> list[tuple[str, float, float]]:
+        """
+        Split text into natural human speech chunks: (chunk_text, speed_multiplier, pause_after_sec).
+        Gives greetings/interjections and emphasized words warmer weight, while keeping follow-ups lively.
+        """
+        if not text:
+            return []
+        raw = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
+        raw = re.sub(r'```[\s\S]*?```', 'Here is the requested code snippet.', raw)
+        raw = re.sub(r'`([^`]+)`', r'\1', raw)
+        raw = re.sub(r'#+\s*', '', raw)
+        raw = re.sub(r'~~(.+?)~~', r'\1', raw)
+        raw = re.sub(r'^\s*[-*•]\s+', '', raw, flags=re.MULTILINE)
+        raw = re.sub(r'\n+', '. ', raw)
+        raw = re.sub(r'https?://\S+', 'link', raw)
+        raw = raw.replace('_', ' ')
+
+        # Normalize stretched conversational letters cleanly so espeak never pronounces extra syllables ("heyy" -> "hey...")
+        raw = re.sub(r'\b(hey)y+\b', r'\1...', raw, flags=re.IGNORECASE)
+        raw = re.sub(r'\b(oh)h+\b', r'\1...', raw, flags=re.IGNORECASE)
+        raw = re.sub(r'\b(yay+|ya+y+)\b', 'Yay!', raw, flags=re.IGNORECASE)
+        raw = re.sub(r'([a-zA-Z])\1{2,}', r'\1\1', raw)
+
+        # Split at sentence boundaries while keeping punctuation
+        parts = [p.strip() for p in re.split(r'(?<=[.!?])\s+', raw) if p.strip()]
+        chunks: list[tuple[str, float, float]] = []
+
+        for idx, part in enumerate(parts):
+            has_emphasis = bool(re.search(r'\*\*[^*]+\*\*', part))
+            clean_part = re.sub(r'\*{1,3}([^*]+?)\*{1,3}', r'\1', part)
+            clean_part = re.sub(r'[^\w\s.,!?:;\'"/—-]', '', clean_part)
+            clean_part = re.sub(r'\.{4,}', '...', clean_part)
+            clean_part = re.sub(r'\s+', ' ', clean_part).strip()
+            if not clean_part or not re.search(r'[a-zA-Z0-9]', clean_part):
+                continue
+
+            word_count = len(clean_part.split())
+            low = clean_part.lower()
+            is_greeting_or_punch = (
+                idx == 0 and word_count <= 4
+                and re.search(r'\b(hey+|hi+|oh+|whoa|wait|boom|boss|got it|alright|ready)\b', low)
+            )
+            if is_greeting_or_punch:
+                # Slower, warmer weight on opening greeting/interjection + natural breath pause
+                chunks.append((clean_part, 0.88, 0.14))
+            elif has_emphasis and word_count <= 10:
+                chunks.append((clean_part, 0.94, 0.12))
+            elif clean_part.endswith('?'):
+                chunks.append((clean_part, 0.98, 0.16))
+            elif clean_part.endswith('!'):
+                chunks.append((clean_part, 1.04, 0.14))
+            else:
+                chunks.append((clean_part, 1.02, 0.12))
+
+        return chunks
+
+    def _base_kokoro_speed(self) -> float:
+        """Convert WPM-style or multiplier rate cleanly into Kokoro speed (0.65..1.45)."""
+        r = float(self.rate)
+        if r <= 3.0:
+            return max(0.65, min(1.45, r))
+        return max(0.65, min(1.45, r / 210.0))
+
+    def _speak_kokoro(self, text: str, gen: int):
+        kokoro = self._get_kokoro()
+        if kokoro is None:
+            return False
+
+        voice_id = self.voice if self.voice in kokoro.voices else "af_heart"
+        lang = "en-gb" if voice_id.startswith("b") else "en-us"
+        chunks = self._prepare_expressive_chunks(text)
+        if not chunks:
+            return True
+
+        base_speed = self._base_kokoro_speed()
+        from concurrent.futures import ThreadPoolExecutor
+
+        def _synth(idx: int):
+            chunk_text, mult, pause_s = chunks[idx]
+            spd = max(0.65, min(1.5, base_speed * mult))
+            samples, sr_hz = kokoro.create(
+                chunk_text,
+                voice=voice_id,
+                speed=spd,
+                lang=lang,
+                sentence_pause=0.18,
+                clause_pause=0.08,
+            )
+            if pause_s > 0 and idx < len(chunks) - 1:
+                silence = np.zeros(int(pause_s * sr_hz), dtype=samples.dtype)
+                samples = np.concatenate([samples, silence])
+            return samples, sr_hz
+
+        try:
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                next_future = pool.submit(_synth, 0)
+                for idx in range(len(chunks)):
+                    with self._gen_lock:
+                        if gen != self._speech_gen:
+                            return True
+                    samples, sr_hz = next_future.result()
+                    if idx + 1 < len(chunks):
+                        next_future = pool.submit(_synth, idx + 1)
+                    with self._gen_lock:
+                        if gen != self._speech_gen:
+                            return True
+                    sd.play(samples, sr_hz, blocking=True)
+            return True
+        except Exception:
+            return False
+
     def speak(self, text: str, wait: bool = True):
-        """Speak text aloud using macOS built-in 'say' command."""
+        """Speak text aloud with expressive Kokoro neural TTS (falling back to macOS 'say' if needed)."""
         if self.muted:
             return
 
-        clean = self.clean_text_for_speech(text)
-        if not clean:
+        if not self.clean_text_for_speech(text):
             return
 
         self.stop()
+        with self._gen_lock:
+            self._speech_gen += 1
+            my_gen = self._speech_gen
         self.is_speaking = True
 
-        cmd = ["say", "-v", self.voice, "-r", str(self.rate), clean]
+        use_kokoro = self._is_kokoro_voice() and (_find_kokoro_files() is not None) and not self._kokoro_failed
 
-        if wait:
+        def _deliver():
             try:
-                subprocess.run(cmd, check=False)
-            finally:
-                self.is_speaking = False
-        else:
-            def _run():
-                try:
+                if use_kokoro and self._speak_kokoro(text, my_gen):
+                    return
+                # Fallback: macOS 'say' with expressive prosody rate tags
+                mac_voice = MACOS_FALLBACK_VOICE if self._is_kokoro_voice() else self.voice
+                mac_rate = int(self.rate * 210) if self.rate <= 3.0 else int(self.rate)
+                clean = self.clean_text_for_speech(text)
+                if not clean:
+                    return
+                with self._gen_lock:
+                    if my_gen != self._speech_gen:
+                        return
+                cmd = ["say", "-v", mac_voice, "-r", str(mac_rate), clean]
+                if wait:
+                    subprocess.run(cmd, check=False)
+                else:
                     self.current_process = subprocess.Popen(cmd)
                     self.current_process.wait()
-                finally:
-                    self.is_speaking = False
-                    self.current_process = None
+            finally:
+                with self._gen_lock:
+                    if my_gen == self._speech_gen:
+                        self.is_speaking = False
+                        self.current_process = None
 
-            t = threading.Thread(target=_run, daemon=True)
-            t.start()
+        if wait:
+            _deliver()
+        else:
+            threading.Thread(target=_deliver, daemon=True).start()
 
     def stop(self):
-        """Interrupt any ongoing speech."""
+        """Interrupt any ongoing speech (both Kokoro sounddevice and macOS say)."""
+        with self._gen_lock:
+            self._speech_gen += 1
+        try:
+            sd.stop()
+        except Exception:
+            pass
         if self.current_process and self.current_process.poll() is None:
             self.current_process.terminate()
             self.current_process = None

@@ -36,9 +36,10 @@ BANNER = """
 def print_welcome(voice_name=TTS_VOICE, voice_speed=TTS_RATE):
     console.print(f"[bold cyan]{BANNER}[/bold cyan]")
     mem = memory_summary()
+    speed_label = f"{voice_speed}x" if float(voice_speed) <= 3.0 else f"{voice_speed} WPM"
     status = (
         f"[bold green]● Model:[/bold green] {MODEL_NAME} (local via Ollama)\n"
-        f"[bold green]● Voice:[/bold green] {voice_name} @ {voice_speed} WPM\n"
+        f"[bold green]● Voice:[/bold green] {voice_name} @ {speed_label}\n"
         f"[bold green]● Memory:[/bold green] {mem}\n"
         f"[bold green]● Mic Trigger:[/bold green] Hold [bold yellow]Cmd+{PTT_TRIGGER_KEY.upper()}[/bold yellow] anywhere on your Mac to speak!\n"
         f"[bold green]● Live Screen:[/bold green] Press [bold yellow]Shift+L[/bold yellow] anywhere to share screen live!\n"
@@ -53,6 +54,7 @@ def print_welcome(voice_name=TTS_VOICE, voice_speed=TTS_RATE):
 def main():
     brain   = JarvisBrain()
     voice   = VoiceEngine()
+    voice.warmup_neural_tts()
     reminders = ReminderEngine(voice_engine=voice)
 
     from core.live import LiveScreenManager, parse_screen_watch_intent
@@ -298,48 +300,53 @@ def main():
                 console.print("[green]Conversation memory cleared (session + disk).[/green]")
                 continue
 
+            # ── Voices list ───────────────────────────────────────────────────
+            elif cmd in ("/voices", "/voice list"):
+                console.print(Panel(
+                    "[bold white]Offline Neural Human Voices (Kokoro-82M):[/bold white]\n"
+                    "• [bold cyan]heart[/bold cyan]    (af_heart)   - Warm, lively & human ★\n"
+                    "• [bold cyan]bella[/bold cyan]    (af_bella)   - Bright, playful & energetic\n"
+                    "• [bold cyan]sky[/bold cyan]      (af_sky)     - Friendly & airy\n"
+                    "• [bold cyan]nova[/bold cyan]     (af_nova)    - Crisp & upbeat\n"
+                    "• [bold cyan]emma[/bold cyan]     (bf_emma)    - British warm female\n"
+                    "• [bold cyan]michael[/bold cyan]  (am_michael) - Smooth American male\n"
+                    "• [bold cyan]fenrir[/bold cyan]   (am_fenrir)  - Bold, energetic male\n"
+                    "• [bold cyan]george[/bold cyan]   (bm_george)  - Classic British butler Jarvis\n\n"
+                    "[bold white]macOS Built-In Fallback Voices:[/bold white]\n"
+                    "• [dim cyan]Karen, Daniel, Samantha, Rishi, Moira, Tessa[/dim cyan]\n"
+                    f"\nActive: [bold green]{voice.voice}[/bold green]  • Change with: [yellow]/voice <name>[/yellow] (e.g. [bold]/voice george[/bold])",
+                    title="Jarvis Neural & System Voices",
+                    border_style="cyan"
+                ))
+                continue
+
             # ── Voice ─────────────────────────────────────────────────────────
-            elif cmd.startswith("/voice"):
+            elif cmd == "/voice" or cmd.startswith("/voice "):
                 parts = user_input.split(maxsplit=1)
                 if len(parts) > 1:
-                    new_voice = parts[1].strip()
-                    voice.voice = new_voice
-                    msg = f"Voice tone updated to {new_voice}."
+                    new_voice = voice.set_voice(parts[1].strip())
+                    msg = f"Voice updated to {new_voice}!"
                     console.print(f"[green]{msg}[/green]")
                     voice.speak(msg, wait=False)
                 else:
-                    console.print(f"[yellow]Current voice: {voice.voice}. Usage: /voice <name> (e.g. /voice Daniel, /voice Samantha, /voice Rishi)[/yellow]")
+                    console.print(f"[yellow]Current voice: {voice.voice}. Type /voices to see all Kokoro neural & macOS voices.[/yellow]")
                 continue
 
             # ── Speed ─────────────────────────────────────────────────────────
-            elif cmd.startswith("/speed"):
+            elif cmd == "/speed" or cmd.startswith("/speed "):
                 parts = user_input.split(maxsplit=1)
                 if len(parts) > 1:
                     try:
-                        new_rate = int(parts[1].strip())
+                        val = float(parts[1].strip())
+                        new_rate = val if val <= 3.0 else int(val)
                         voice.rate = new_rate
-                        msg = f"Voice speed set to {new_rate} words per minute."
+                        msg = f"Voice speed set to {new_rate}!"
                         console.print(f"[green]{msg}[/green]")
                         voice.speak(msg, wait=False)
                     except ValueError:
-                        console.print("[red]Please specify speed as a number (e.g., /speed 230).[/red]")
+                        console.print("[red]Please specify speed as a number (e.g., /speed 215 or /speed 1.1).[/red]")
                 else:
-                    console.print(f"[yellow]Current speed: {voice.rate} WPM. Usage: /speed <number>[/yellow]")
-                continue
-
-            # ── Voices list ───────────────────────────────────────────────────
-            elif cmd == "/voices":
-                console.print(Panel(
-                    "• [bold cyan]Samantha[/bold cyan] (en_US) - Modern, crisp, Siri/assistant tone\n"
-                    "• [bold cyan]Daniel[/bold cyan]   (en_GB) - Classic British butler Jarvis tone\n"
-                    "• [bold cyan]Rishi[/bold cyan]    (en_IN) - Indian English tone\n"
-                    "• [bold cyan]Karen[/bold cyan]    (en_AU) - Cheeky Sidekick — current active voice ★\n"
-                    "• [bold cyan]Moira[/bold cyan]    (en_IE) - Irish English tone\n"
-                    "• [bold cyan]Tessa[/bold cyan]    (en_ZA) - South African English tone\n"
-                    "\nChange with: [yellow]/voice <name>[/yellow] (e.g. [bold]/voice Daniel[/bold])",
-                    title="Popular English Voices",
-                    border_style="cyan"
-                ))
+                    console.print(f"[yellow]Current speed: {voice.rate}. Usage: /speed <number> (e.g. 215 or 1.1)[/yellow]")
                 continue
 
             # ── Status ────────────────────────────────────────────────────────
