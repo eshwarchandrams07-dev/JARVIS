@@ -67,7 +67,7 @@ class BrowserController:
         Gracefully pause without terminating so the user can log in or enter an OTP in the browser.
         Resumes immediately once the user confirms.
         """
-        notice = f"Please log in to {service_name} in your browser window, boss. I'll wait right here until you're logged in."
+        notice = f"Please log in to {service_name} in your browser window, sir. I shall wait right here until you are ready."
         console.print(f"\n[bold yellow]🔒 USER LOGIN REQUIRED:[/bold yellow] [bold white]{notice}[/bold white]")
         
         self.speak(notice)
@@ -213,7 +213,7 @@ class BrowserController:
             code, out, err = self._run_chrome_js(js)
 
         # 2. Reply to active web chat (e.g. WhatsApp Web)
-        if re.match(r"^(?:reply|send reply|send message|respond)\b", cmd_lower):
+        elif re.match(r"^(?:reply|send reply|send message|respond)\b", cmd_lower):
             m_rep = re.match(r"^(?:reply(?:\s+(?:my\s+)?(?:whatsapp|chat|message|msg))?\s+(?:with|saying)?|reply|send reply(?:\s+with)?|send message)\s+(.+?)(?:\s+message)?$", cmd, re.IGNORECASE)
             reply_text = m_rep.group(1).strip(" '\"") if m_rep else cmd
             from core.app_control import AppController

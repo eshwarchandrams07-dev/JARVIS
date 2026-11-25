@@ -63,19 +63,27 @@ class ReminderEngine:
         Returns None if unparseable.
         """
         text = text.strip().lower()
+        if not text or re.search(r"-\s*\d", text):
+            return None
         total = 0.0
         found = False
 
         patterns = [
-            (r"(\d+(?:\.\d+)?)\s*h(?:ours?)?", 3600),
-            (r"(\d+(?:\.\d+)?)\s*m(?:in(?:utes?)?)?", 60),
-            (r"(\d+(?:\.\d+)?)\s*s(?:ec(?:onds?)?)?", 1),
+            (r"(?<![0-9][eE])(?<![.\d])(\d+(?:\.\d+)?)\s*h(?:ours?|rs?)?(?![a-z])", 3600),
+            (r"(?<![0-9][eE])(?<![.\d])(\d+(?:\.\d+)?)\s*m(?:in(?:utes?|s)?)?(?![a-z])", 60),
+            (r"(?<![0-9][eE])(?<![.\d])(\d+(?:\.\d+)?)\s*s(?:ec(?:onds?|s)?)?(?![a-z])", 1),
         ]
         for pattern, multiplier in patterns:
             m = re.search(pattern, text)
             if m:
-                total += float(m.group(1)) * multiplier
+                val = float(m.group(1))
+                if val != val or val == float("inf"):  # NaN or Inf guard
+                    return None
+                total += val * multiplier
                 found  = True
+
+        if found and total != total:  # final NaN guard
+            return None
 
         return total if found else None
 
@@ -95,17 +103,22 @@ class ReminderEngine:
                 f"Couldn't parse '{duration_text}' as a duration. "
                 "Try something like '5m', '30s', or '1h30m'."
             )
+        if seconds > 31_536_000:
+            return f"Duration '{duration_text}' is too long (maximum reminder duration is 365 days)."
 
         def _fire():
             alert = f"⏰ Reminder: {message}"
             notify("Jarvis Reminder", message, sound=True)
             console.print(f"\n[bold yellow]{alert}[/bold yellow]\n")
             if self.voice:
-                self.voice.speak(f"Hey boss! Reminder: {message}", wait=False)
+                self.voice.speak(f"Pardon the interruption, sir. Reminder: {message}", wait=False)
 
-        t = threading.Timer(seconds, _fire)
-        t.daemon = True
-        t.start()
+        try:
+            t = threading.Timer(seconds, _fire)
+            t.daemon = True
+            t.start()
+        except OverflowError:
+            return f"Duration '{duration_text}' exceeds the system timer limit."
         with self._lock:
             self._timers.append(t)
 
@@ -157,7 +170,7 @@ def build_daily_briefing(voice_engine=None) -> str:
     notes_line = "No notes on record." if "No notes" in notes else notes
 
     briefing = (
-        f"Good {tod}, boss! It's {time_}. "
+        f"Good {tod}, sir. It is {time_}. "
         f"Battery: {batt}. CPU load: {cpu}. Disk: {disk}. "
         f"Your recent notes: {notes_line}"
     )

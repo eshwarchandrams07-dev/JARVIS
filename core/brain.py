@@ -3,7 +3,11 @@ import json
 import re
 import threading
 import requests
-from config import OLLAMA_BASE_URL, MODEL_NAME, JARVIS_SYSTEM_PROMPT
+from config import (
+    OLLAMA_BASE_URL, MODEL_NAME, JARVIS_SYSTEM_PROMPT,
+    AI_PROVIDER, GEMINI_MODEL, GROQ_MODEL, GROQ_VISION_MODEL, OPENAI_MODEL,
+    get_api_key, save_secret,
+)
 from core.tools import TOOL_DEFINITIONS, execute_tool
 from core.memory import load_memory, save_memory, clear_memory
 
@@ -134,8 +138,55 @@ class JarvisBrain:
         self.chat_url = f"{self.base_url}/api/chat"
         self.session = requests.Session()
         self._lock = threading.Lock()
+        self.provider_pref = AI_PROVIDER  # 'auto', 'gemini', 'groq', 'openai', or 'ollama'/'local'
         # Load persisted memory from disk (keeps last 6 turns cleanly with tool_calls)
         self.messages = load_memory(JARVIS_SYSTEM_PROMPT)
+
+    def active_provider(self) -> str:
+        """Resolve which AI backend ('gemini', 'groq', 'openai', or 'ollama') will serve requests."""
+        pref = (self.provider_pref or "auto").lower().strip()
+        if pref in ("local", "ollama"):
+            return "ollama"
+        if pref in ("gemini", "groq", "openai") and get_api_key(pref):
+            return pref
+        # Auto mode: prefer Gemini (text+vision+tools), then Groq, then OpenAI, else local Ollama
+        for cand in ("gemini", "groq", "openai"):
+            if get_api_key(cand):
+                return cand
+        return "ollama"
+
+    def engine_label(self) -> str:
+        p = self.active_provider()
+        if p == "gemini":
+            return f"{GEMINI_MODEL} (Gemini Cloud API — Fast)"
+        if p == "groq":
+            return f"{GROQ_MODEL} (Groq Cloud API — Ultra Fast)"
+        if p == "openai":
+            return f"{OPENAI_MODEL} (OpenAI Cloud API — Fast)"
+        return f"{self.model} (local via Ollama)"
+
+    def set_engine(self, mode: str) -> str:
+        m = mode.lower().strip()
+        if m in ("local", "ollama"):
+            self.provider_pref = "ollama"
+            save_secret("provider", "ollama")
+            return f"Switched AI engine to {self.engine_label()}."
+        if m == "cloud":
+            m = "auto"
+        if m == "auto":
+            self.provider_pref = "auto"
+            save_secret("provider", "auto")
+            resolved = self.active_provider()
+            if resolved == "ollama":
+                return "No cloud API key found yet—staying on local Ollama. Add a key anytime with: /apikey gemini YOUR_KEY"
+            return f"Switched AI engine to {self.engine_label()}."
+        if m in ("gemini", "groq", "openai"):
+            if not get_api_key(m):
+                return f"No API key saved for '{m}'. Run: /apikey {m} YOUR_API_KEY"
+            self.provider_pref = m
+            save_secret("provider", m)
+            return f"Switched AI engine to {self.engine_label()}."
+        return "Unknown engine. Use: /engine gemini | groq | openai | local | auto"
 
     def reset(self):
         """Reset conversation memory (in-memory AND on disk)."""
@@ -151,7 +202,205 @@ class JarvisBrain:
             return ""
         return re.sub(r'<think>[\s\S]*?</think>', '', text).strip()
 
-    def _post_chat(self, messages: list[dict], use_tools: bool = True, temperature: float = 0.15, num_predict: int = 180) -> dict:
+    @staticmethod
+    def _to_gemini_schema(schema: dict) -> dict:
+        """Convert OpenAI JSON Schema parameter definition into Gemini v1beta FunctionDeclaration schema."""
+        if not isinstance(schema, dict):
+            return {"type": "STRING"}
+        t = str(schema.get("type", "string")).upper()
+        out: dict = {"type": t}
+        if "description" in schema:
+            out["description"] = schema["description"]
+        if "enum" in schema:
+            out["enum"] = schema["enum"]
+        if t == "OBJECT":
+            props = {k: JarvisBrain._to_gemini_schema(v) for k, v in schema.get("properties", {}).items()}
+            if props:
+                out["properties"] = props
+            if schema.get("required"):
+                out["required"] = list(schema["required"])
+        elif t == "ARRAY" and "items" in schema:
+            out["items"] = JarvisBrain._to_gemini_schema(schema["items"])
+        return out
+
+    def _post_gemini(self, messages: list[dict], use_tools: bool, temperature: float, num_predict: int) -> dict:
+        api_key = get_api_key("gemini")
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+        headers = {"x-goog-api-key": api_key, "Content-Type": "application/json"}
+
+        sys_text = ""
+        contents = []
+        pending_tool_names: list[str] = []
+
+        for m in messages:
+            role = m.get("role")
+            if role == "system":
+                sys_text = (sys_text + "\n" + str(m.get("content", ""))).strip()
+            elif role == "user":
+                parts: list[dict] = [{"text": str(m.get("content", ""))}]
+                for b64 in m.get("images", []):
+                    parts.append({"inlineData": {"mimeType": "image/jpeg", "data": b64}})
+                contents.append({"role": "user", "parts": parts})
+            elif role == "assistant":
+                parts = []
+                txt = str(m.get("content", "")).strip()
+                if txt:
+                    parts.append({"text": txt})
+                tcs = m.get("tool_calls") or []
+                pending_tool_names = []
+                for tc in tcs:
+                    fn = tc.get("function", {})
+                    tname = fn.get("name", "")
+                    targs = fn.get("arguments", {})
+                    if isinstance(targs, str):
+                        try:
+                            targs = json.loads(targs)
+                        except Exception:
+                            targs = {}
+                    pending_tool_names.append(tname)
+                    parts.append({"functionCall": {"name": tname, "args": targs}})
+                if parts:
+                    contents.append({"role": "model", "parts": parts})
+            elif role == "tool":
+                tname = pending_tool_names.pop(0) if pending_tool_names else "tool_result"
+                contents.append({
+                    "role": "function",
+                    "parts": [{
+                        "functionResponse": {
+                            "name": tname,
+                            "response": {"result": str(m.get("content", ""))},
+                        }
+                    }],
+                })
+
+        body: dict = {
+            "contents": contents,
+            "generationConfig": {
+                "temperature": temperature,
+                "maxOutputTokens": max(256, num_predict),
+                "thinkingConfig": {"thinkingBudget": 0},
+            },
+        }
+        if sys_text:
+            body["systemInstruction"] = {"parts": [{"text": sys_text}]}
+        if use_tools:
+            body["tools"] = [{
+                "functionDeclarations": [
+                    {
+                        "name": td["function"]["name"],
+                        "description": td["function"].get("description", ""),
+                        "parameters": self._to_gemini_schema(td["function"].get("parameters", {"type": "object", "properties": {}})),
+                    }
+                    for td in TOOL_DEFINITIONS
+                ]
+            }]
+
+        resp = self.session.post(url, headers=headers, json=body, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+
+        cand = (data.get("candidates") or [{}])[0]
+        parts = cand.get("content", {}).get("parts", [])
+        text_parts = []
+        tool_calls = []
+        for p in parts:
+            if "text" in p:
+                text_parts.append(p["text"])
+            if "functionCall" in p:
+                fc = p["functionCall"]
+                tool_calls.append({
+                    "function": {
+                        "name": fc.get("name", ""),
+                        "arguments": fc.get("args", {}),
+                    }
+                })
+        msg: dict = {"role": "assistant", "content": "".join(text_parts).strip()}
+        if tool_calls:
+            msg["tool_calls"] = tool_calls
+        return {"message": msg}
+
+    def _post_openai_compat(self, provider: str, messages: list[dict], use_tools: bool, temperature: float, num_predict: int) -> dict:
+        api_key = get_api_key(provider)
+        if provider == "groq":
+            url = "https://api.groq.com/openai/v1/chat/completions"
+            has_img = any(m.get("images") for m in messages)
+            model = GROQ_VISION_MODEL if has_img else GROQ_MODEL
+        else:
+            url = "https://api.openai.com/v1/chat/completions"
+            model = OPENAI_MODEL
+
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        oai_msgs = []
+        pending_ids: list[str] = []
+        call_seq = 0
+
+        for m in messages:
+            role = m.get("role")
+            if role in ("system", "user"):
+                imgs = m.get("images") or []
+                if imgs and role == "user":
+                    content_arr: list[dict] = [{"type": "text", "text": str(m.get("content", ""))}]
+                    for b64 in imgs:
+                        content_arr.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
+                    oai_msgs.append({"role": "user", "content": content_arr})
+                else:
+                    oai_msgs.append({"role": role, "content": str(m.get("content", ""))})
+            elif role == "assistant":
+                tcs = m.get("tool_calls") or []
+                if tcs:
+                    formatted_tcs = []
+                    pending_ids = []
+                    for tc in tcs:
+                        call_seq += 1
+                        cid = tc.get("id") or f"call_{call_seq}"
+                        pending_ids.append(cid)
+                        fn = tc.get("function", {})
+                        args = fn.get("arguments", {})
+                        args_str = args if isinstance(args, str) else json.dumps(args)
+                        formatted_tcs.append({
+                            "id": cid,
+                            "type": "function",
+                            "function": {"name": fn.get("name", ""), "arguments": args_str},
+                        })
+                    oai_msgs.append({"role": "assistant", "content": m.get("content") or None, "tool_calls": formatted_tcs})
+                else:
+                    oai_msgs.append({"role": "assistant", "content": str(m.get("content", ""))})
+            elif role == "tool":
+                cid = pending_ids.pop(0) if pending_ids else f"call_{call_seq}"
+                oai_msgs.append({"role": "tool", "tool_call_id": cid, "content": str(m.get("content", ""))})
+
+        body: dict = {
+            "model": model,
+            "messages": oai_msgs,
+            "temperature": temperature,
+            "max_tokens": max(256, num_predict),
+        }
+        if use_tools:
+            body["tools"] = TOOL_DEFINITIONS
+
+        resp = self.session.post(url, headers=headers, json=body, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        choice_msg = (data.get("choices") or [{}])[0].get("message", {})
+
+        msg: dict = {"role": "assistant", "content": (choice_msg.get("content") or "").strip()}
+        if choice_msg.get("tool_calls"):
+            parsed_tcs = []
+            for tc in choice_msg["tool_calls"]:
+                fn = tc.get("function", {})
+                raw_args = fn.get("arguments", "{}")
+                try:
+                    args_dict = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                except Exception:
+                    args_dict = {}
+                parsed_tcs.append({
+                    "id": tc.get("id"),
+                    "function": {"name": fn.get("name", ""), "arguments": args_dict},
+                })
+            msg["tool_calls"] = parsed_tcs
+        return {"message": msg}
+
+    def _post_ollama(self, messages: list[dict], use_tools: bool, temperature: float, num_predict: int) -> dict:
         payload = {
             "model": self.model,
             "messages": messages,
@@ -168,6 +417,20 @@ class JarvisBrain:
         resp = self.session.post(self.chat_url, json=payload, timeout=60)
         resp.raise_for_status()
         return resp.json()
+
+    def _post_chat(self, messages: list[dict], use_tools: bool = True, temperature: float = 0.15, num_predict: int = 180) -> dict:
+        provider = self.active_provider()
+        if provider == "gemini":
+            try:
+                return self._post_gemini(messages, use_tools, temperature, num_predict)
+            except Exception:
+                return self._post_ollama(messages, use_tools, temperature, num_predict)
+        if provider in ("groq", "openai"):
+            try:
+                return self._post_openai_compat(provider, messages, use_tools, temperature, num_predict)
+            except Exception:
+                return self._post_ollama(messages, use_tools, temperature, num_predict)
+        return self._post_ollama(messages, use_tools, temperature, num_predict)
 
     def chat(self, user_input: str, on_tool_call=None, image_b64: str | None = None) -> str:
         """
@@ -205,11 +468,11 @@ class JarvisBrain:
 
             try:
                 data = self._post_chat(self.messages, use_tools=True, temperature=0.15, num_predict=180)
-            except requests.exceptions.RequestException as e:
-                # Roll back dangling user message on network failure to keep history aligned
+            except Exception as e:
+                # Roll back dangling user message on network/provider failure to keep history aligned
                 if self.messages and self.messages[-1] is user_msg:
                     self.messages.pop()
-                return f"My apologies, sir. I encountered a communication error with the local model: {e}"
+                return f"My apologies, sir. I encountered a communication error with the AI model: {e}"
 
             msg = data.get("message", {})
             tool_calls = msg.get("tool_calls")
@@ -303,7 +566,7 @@ class JarvisBrain:
                         final_clean = f"I completed the action, sir. Here is the result:\n{result}"
                     break
                 else:
-                    final_clean = result or "Completed your requested steps, boss!"
+                    final_clean = result or "All requested tasks are complete, sir."
 
                 self.messages.append({"role": "assistant", "content": final_clean})
                 if "images" in user_msg:

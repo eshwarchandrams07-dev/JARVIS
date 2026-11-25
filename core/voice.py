@@ -105,16 +105,23 @@ def create_safe_input_stream(device=None, sample_rate=AUDIO_SAMPLE_RATE, channel
     raise last_error or RuntimeError("Could not open any audio input stream.")
 
 KOKORO_VOICE_ALIASES = {
+    "jarvis": "bm_jarvis",
+    "mcu": "bm_jarvis",
+    "ironman": "bm_jarvis",
+    "george": "bm_george",
+    "daniel": "bm_daniel",
+    "lewis": "bm_lewis",
+    "fable": "bm_fable",
+    "emma": "bf_emma",
     "heart": "af_heart",
     "bella": "af_bella",
     "sky": "af_sky",
     "nova": "af_nova",
-    "emma": "bf_emma",
     "michael": "am_michael",
     "fenrir": "am_fenrir",
-    "george": "bm_george",
 }
 MACOS_FALLBACK_VOICE = "Karen"
+MACOS_BRITISH_FALLBACK_VOICE = "Daniel"
 
 
 def _find_kokoro_files() -> tuple[str, str] | None:
@@ -159,6 +166,66 @@ class VoiceEngine:
     def _is_kokoro_voice(self) -> bool:
         v = self.voice.lower()
         return v in KOKORO_VOICE_ALIASES or re.match(r"^[ab][fm]_[a-z]+$", v) is not None
+
+    def _is_jarvis_voice(self) -> bool:
+        return self.voice.lower() == "bm_jarvis"
+
+    @staticmethod
+    def _build_jarvis_style(kokoro) -> str | np.ndarray:
+        """
+        Blend Kokoro's British male RP embeddings into a composed, articulate J.A.R.V.I.S. timbre:
+        George (butler gravitas) + Daniel (crisp BBC clarity) + Lewis (warm baritone).
+        """
+        voices = getattr(kokoro, "voices", {})
+        weights = (("bm_george", 0.45), ("bm_daniel", 0.40), ("bm_lewis", 0.15))
+        blend = None
+        total_w = 0.0
+        for name, w in weights:
+            if name in voices:
+                vec = np.asarray(voices[name], dtype=np.float32)
+                blend = (vec * w) if blend is None else (blend + vec * w)
+                total_w += w
+        if blend is not None and total_w > 0.0:
+            return (blend / total_w).astype(np.float32)
+        for fallback in ("bm_george", "bm_daniel", "af_heart"):
+            if fallback in voices:
+                return fallback
+        return "af_heart"
+
+    @staticmethod
+    def _apply_jarvis_hud_fx(samples: np.ndarray, sr_hz: int) -> np.ndarray:
+        """
+        Apply a subtle Iron Man J.A.R.V.I.S. AI acoustic sheen:
+        tightens sub-bass boom, lifts consonant clarity, and blends clean micro room reflections.
+        """
+        if len(samples) < 64 or sr_hz <= 0:
+            return samples
+        x = np.nan_to_num(samples.astype(np.float32, copy=True), nan=0.0, posinf=0.0, neginf=0.0)
+        peak_in = float(np.max(np.abs(x)))
+        if peak_in < 1e-6:
+            return x
+
+        # Crisp vocal clarity without thinning baritone warmth
+        hp = np.empty_like(x)
+        hp[0] = x[0]
+        hp[1:] = x[1:] - 0.92 * x[:-1]
+        clean = (0.88 * x) + (0.12 * hp)
+
+        # Ultra-clean Stark hologram early reflections (8.5ms + 19ms)
+        out = clean.copy()
+        d1 = int(0.0085 * sr_hz)
+        d2 = int(0.0190 * sr_hz)
+        if d1 > 0 and len(out) > d1:
+            out[d1:] += 0.065 * clean[:-d1]
+        if d2 > 0 and len(out) > d2:
+            out[d2:] += 0.028 * clean[:-d2]
+
+        peak_out = float(np.max(np.abs(out)))
+        if peak_out > peak_in and peak_out > 0.0:
+            target = min(peak_in * 1.03, 0.94)
+            if peak_out > target:
+                out *= (target / peak_out)
+        return out
 
     def _get_kokoro(self):
         """Lazily load local Kokoro-82M ONNX engine (thread-safe, offline)."""
@@ -245,24 +312,27 @@ class VoiceEngine:
 
             word_count = len(clean_part.split())
             low = clean_part.lower()
+            is_jarvis = self._is_jarvis_voice()
             is_greeting_or_punch = (
-                idx == 0 and word_count <= 4
-                and re.search(r'\b(hey+|hi+|oh+|whoa|wait|boom|boss|got it|alright|ready)\b', low)
+                idx == 0 and word_count <= 5
+                and re.search(
+                    r'\b(sir|right away|at once|very well|certainly|indeed|systems|hey+|hi+|oh+|whoa|wait|boom|boss|got it|alright|ready)\b',
+                    low,
+                )
             )
             if is_greeting_or_punch:
-                # Slower, warmer weight on opening greeting/interjection + natural breath pause
-                chunks.append((clean_part, 0.88, 0.14))
+                chunks.append((clean_part, 0.87 if is_jarvis else 0.88, 0.15 if is_jarvis else 0.14))
             elif has_emphasis and word_count <= 10:
-                chunks.append((clean_part, 0.94, 0.14))
+                chunks.append((clean_part, 0.92 if is_jarvis else 0.94, 0.14))
             elif clean_part.endswith('?'):
-                chunks.append((clean_part, 0.98, 0.20))
+                chunks.append((clean_part, 0.95 if is_jarvis else 0.98, 0.20))
             elif clean_part.endswith('!'):
-                chunks.append((clean_part, 1.03, 0.18))
+                chunks.append((clean_part, 0.95 if is_jarvis else 1.03, 0.18))
             elif clean_part.endswith('.'):
                 # Declarative full-stop sentence: gently relaxed pace + fuller breath pause
-                chunks.append((clean_part, 0.95, 0.26))
+                chunks.append((clean_part, 0.92 if is_jarvis else 0.95, 0.26))
             else:
-                chunks.append((clean_part, 1.00, 0.16))
+                chunks.append((clean_part, 0.94 if is_jarvis else 1.00, 0.16))
 
         return chunks
 
@@ -315,8 +385,13 @@ class VoiceEngine:
         if kokoro is None:
             return False
 
-        voice_id = self.voice if self.voice in kokoro.voices else "af_heart"
-        lang = "en-gb" if voice_id.startswith("b") else "en-us"
+        is_jarvis = self._is_jarvis_voice()
+        if is_jarvis:
+            voice_param = self._build_jarvis_style(kokoro)
+            lang = "en-gb"
+        else:
+            voice_param = self.voice if self.voice in kokoro.voices else "af_heart"
+            lang = "en-gb" if str(voice_param).startswith("b") else "en-us"
         chunks = self._prepare_expressive_chunks(text)
         if not chunks:
             return True
@@ -330,13 +405,15 @@ class VoiceEngine:
             is_period = chunk_text.endswith(".") and not chunk_text.endswith("...")
             samples, sr_hz = kokoro.create(
                 chunk_text,
-                voice=voice_id,
+                voice=voice_param,
                 speed=spd,
                 lang=lang,
                 trim=False,
                 sentence_pause=0.22,
                 clause_pause=0.10,
             )
+            if is_jarvis:
+                samples = self._apply_jarvis_hud_fx(samples, sr_hz)
             samples = self._shape_phrase_envelope(samples, sr_hz, soft_ending=is_period)
             if pause_s > 0 and idx < len(chunks) - 1:
                 silence = np.zeros(int(pause_s * sr_hz), dtype=samples.dtype)
@@ -406,7 +483,10 @@ class VoiceEngine:
                 if use_kokoro and self._speak_kokoro(text, my_gen):
                     return
                 # Fallback: macOS 'say' with expressive prosody rate tags
-                mac_voice = MACOS_FALLBACK_VOICE if self._is_kokoro_voice() else self.voice
+                if self._is_kokoro_voice():
+                    mac_voice = MACOS_BRITISH_FALLBACK_VOICE if self.voice.lower().startswith("b") else MACOS_FALLBACK_VOICE
+                else:
+                    mac_voice = self.voice
                 mac_rate = int(self.rate * 210) if self.rate <= 3.0 else int(self.rate)
                 clean = self.clean_text_for_speech(text)
                 if not clean:

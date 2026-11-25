@@ -139,7 +139,7 @@ def clear_memory():
                 os.remove(path)
         except Exception:
             pass
-    return "Memory wiped. Fresh start, boss!"
+    return "Memory banks cleared. A clean slate, sir."
 
 
 def memory_summary() -> str:

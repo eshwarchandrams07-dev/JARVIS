@@ -33,18 +33,21 @@ BANNER = """
    ╚═══════════════════════════════════════════════════════════╝
 """
 
-def print_welcome(voice_name=TTS_VOICE, voice_speed=TTS_RATE):
+def print_welcome(voice_name=TTS_VOICE, voice_speed=TTS_RATE, engine_label=f"{MODEL_NAME} (local via Ollama)"):
+    from config import get_safe_mode
     console.print(f"[bold cyan]{BANNER}[/bold cyan]")
     mem = memory_summary()
     speed_label = f"{voice_speed}x" if float(voice_speed) <= 3.0 else f"{voice_speed} WPM"
+    safe_mode = get_safe_mode().upper()
     status = (
-        f"[bold green]● Model:[/bold green] {MODEL_NAME} (local via Ollama)\n"
+        f"[bold green]● AI Engine:[/bold green] {engine_label}\n"
+        f"[bold green]● Safe Mode:[/bold green] [bold yellow]{safe_mode}[/bold yellow] (use [yellow]/safe[/yellow] to lock/adjust permissions)\n"
         f"[bold green]● Voice:[/bold green] {voice_name} @ {speed_label}\n"
         f"[bold green]● Memory:[/bold green] {mem}\n"
         f"[bold green]● Mic Trigger:[/bold green] Hold [bold yellow]Cmd+{PTT_TRIGGER_KEY.upper()}[/bold yellow] anywhere on your Mac to speak!\n"
         f"[bold green]● Live Screen:[/bold green] Press [bold yellow]Shift+L[/bold yellow] anywhere to share screen live!\n"
         f"[bold green]● Commands:[/bold green] "
-        f"[yellow]/watch[/yellow] [yellow]/screen[/yellow] [yellow]/mode[/yellow] [yellow]/live[/yellow] [yellow]/stop[/yellow] "
+        f"[yellow]/safe[/yellow] [yellow]/engine[/yellow] [yellow]/apikey[/yellow] [yellow]/watch[/yellow] [yellow]/screen[/yellow] [yellow]/mode[/yellow] [yellow]/live[/yellow] [yellow]/stop[/yellow] "
         f"[yellow]/remind[/yellow] [yellow]/briefing[/yellow] [yellow]/memory[/yellow] "
         f"[yellow]/voice[/yellow] [yellow]/speed[/yellow] [yellow]/voices[/yellow] "
         f"[yellow]/status[/yellow] [yellow]/clear[/yellow] [yellow]/exit[/yellow]"
@@ -70,7 +73,7 @@ def main():
     _screen_watcher.brain     = brain
     _tools_mod._reminder_engine = reminders
 
-    print_welcome(voice.voice, voice.rate)
+    print_welcome(voice.voice, voice.rate, brain.engine_label())
 
     # Check microphone permission asynchronously so startup stays instant
     from core.voice import check_microphone_permission
@@ -98,9 +101,9 @@ def main():
     # Boot greeting — mention memory if any turns loaded
     history_turns = len([m for m in brain.messages if m.get("role") == "user"])
     if history_turns > 0:
-        greeting = f"Welcome back, boss! I remember our last {history_turns} conversation turn{'s' if history_turns != 1 else ''}. What are we smashing today?"
+        greeting = f"Welcome back, sir. I have restored our last {history_turns} conversation turn{'s' if history_turns != 1 else ''}. How may I be of service?"
     else:
-        greeting = "Systems online, boss! What fun or mischief are we getting into today?"
+        greeting = "Systems online, sir. All diagnostics nominal—how may I assist you?"
 
     console.print(f"\n[bold cyan]Jarvis:[/bold cyan] {greeting}\n")
     voice.speak(greeting, wait=False)
@@ -192,7 +195,7 @@ def main():
 
             # ── Exit ──────────────────────────────────────────────────────────
             if cmd in ("/exit", "exit", "quit", "goodbye"):
-                farewell = "Powering down! Catch you later, boss—stay awesome!"
+                farewell = "Powering down systems, sir. Until next time."
                 console.print(f"\n[bold cyan]Jarvis:[/bold cyan] {farewell}\n")
                 voice.speak(farewell, wait=True)
                 break
@@ -212,7 +215,33 @@ def main():
 
             # ── Live Screen Sharing Toggle ────────────────────────────────────
             elif cmd in ("/screen", "screen", "live screen", "shift+l", "shift l"):
-                live_screen.toggle()
+                is_now_live = live_screen.toggle()
+                if is_now_live and brain.active_provider() != "ollama":
+                    console.print(f"[bold yellow]⚠️ Privacy Note:[/bold yellow] Cloud AI ({brain.active_provider()}) is active — Live Screen frames are sent to that API. Run [yellow]/engine local[/yellow] for 100% offline screen viewing.")
+                continue
+
+            # ── Security & Safe Mode ──────────────────────────────────────────
+            elif cmd == "/safe" or cmd.startswith("/safe "):
+                from config import get_safe_mode, set_safe_mode
+                parts = user_input.split(maxsplit=1)
+                if len(parts) > 1:
+                    res = set_safe_mode(parts[1].strip())
+                    if res in ("strict", "guarded", "unattended"):
+                        msg = f"Safe Mode updated to {res.upper()}."
+                        console.print(f"[bold green]🛡️ {msg}[/bold green]")
+                        voice.speak(msg, wait=False)
+                    else:
+                        console.print(f"[yellow]{res}[/yellow]")
+                else:
+                    cur = get_safe_mode()
+                    console.print(Panel(
+                        f"[bold white]Current Safe Mode:[/bold white] [bold yellow]{cur.upper()}[/bold yellow]\n\n"
+                        "• [bold cyan]/safe strict[/bold cyan] — Terminal COMPLETELY DISABLED; typing, messaging, web clicks, clipboard & cloud screen share require Cancel/Allow confirmation.\n"
+                        "• [bold cyan]/safe on[/bold cyan]     — [green](Default)[/green] Read-only shell info OK; shell writes, typing, chat replies, web clicks, app close & lock ask Cancel/Allow.\n"
+                        "• [bold cyan]/safe off[/bold cyan]    — Hands-free unattended automation (catastrophic shell blocklist & secret redaction remain active).\n",
+                        title="Jarvis Security & Permissions",
+                        border_style="yellow",
+                    ))
                 continue
 
             # ── Stop all watchers ─────────────────────────────────────────────
@@ -238,7 +267,7 @@ def main():
                 continue
 
             # ── Screen Trigger Watcher ─────────────────────────────────────────
-            elif cmd.startswith("/watch"):
+            elif cmd == "/watch" or cmd.startswith("/watch "):
                 raw_arg = user_input.split(maxsplit=1)[1].strip() if len(user_input.split()) > 1 else ""
                 if not raw_arg:
                     console.print("[yellow]Usage: /watch <trigger> [then <action>][/yellow]\n"
@@ -254,7 +283,7 @@ def main():
                 continue
 
             # ── Live watcher ──────────────────────────────────────────────────
-            elif cmd.startswith("/live"):
+            elif cmd == "/live" or cmd.startswith("/live "):
                 parts = user_input.split(maxsplit=2)
                 if len(parts) > 1:
                     target    = parts[1]
@@ -265,7 +294,7 @@ def main():
                 continue
 
             # ── Reminder ─────────────────────────────────────────────────────
-            elif cmd.startswith("/remind"):
+            elif cmd == "/remind" or cmd.startswith("/remind "):
                 # /remind <duration> <message>  e.g. /remind 5m check FFCS
                 parts = user_input.split(maxsplit=2)
                 if len(parts) >= 3:
@@ -304,17 +333,21 @@ def main():
             elif cmd in ("/voices", "/voice list"):
                 console.print(Panel(
                     "[bold white]Offline Neural Human Voices (Kokoro-82M):[/bold white]\n"
-                    "• [bold cyan]heart[/bold cyan]    (af_heart)   - Warm, lively & human ★\n"
-                    "• [bold cyan]bella[/bold cyan]    (af_bella)   - Bright, playful & energetic\n"
-                    "• [bold cyan]sky[/bold cyan]      (af_sky)     - Friendly & airy\n"
-                    "• [bold cyan]nova[/bold cyan]     (af_nova)    - Crisp & upbeat\n"
+                    "• [bold cyan]jarvis[/bold cyan]   (bm_jarvis)  - Iron Man British RP butler + AI sheen ★\n"
+                    "• [bold cyan]george[/bold cyan]   (bm_george)  - Classic British butler\n"
+                    "• [bold cyan]daniel[/bold cyan]   (bm_daniel)  - Poised British RP\n"
+                    "• [bold cyan]lewis[/bold cyan]    (bm_lewis)   - Warm British baritone\n"
+                    "• [bold cyan]fable[/bold cyan]    (bm_fable)   - Crisp British narrator\n"
                     "• [bold cyan]emma[/bold cyan]     (bf_emma)    - British warm female\n"
                     "• [bold cyan]michael[/bold cyan]  (am_michael) - Smooth American male\n"
                     "• [bold cyan]fenrir[/bold cyan]   (am_fenrir)  - Bold, energetic male\n"
-                    "• [bold cyan]george[/bold cyan]   (bm_george)  - Classic British butler Jarvis\n\n"
+                    "• [bold cyan]heart[/bold cyan]    (af_heart)   - Warm American female\n"
+                    "• [bold cyan]bella[/bold cyan]    (af_bella)   - Bright, playful female\n"
+                    "• [bold cyan]sky[/bold cyan]      (af_sky)     - Friendly & airy\n"
+                    "• [bold cyan]nova[/bold cyan]     (af_nova)    - Crisp & upbeat\n\n"
                     "[bold white]macOS Built-In Fallback Voices:[/bold white]\n"
-                    "• [dim cyan]Karen, Daniel, Samantha, Rishi, Moira, Tessa[/dim cyan]\n"
-                    f"\nActive: [bold green]{voice.voice}[/bold green]  • Change with: [yellow]/voice <name>[/yellow] (e.g. [bold]/voice george[/bold])",
+                    "• [dim cyan]Daniel (British), Karen, Samantha, Rishi, Moira, Tessa[/dim cyan]\n"
+                    f"\nActive: [bold green]{voice.voice}[/bold green]  • Change with: [yellow]/voice <name>[/yellow] (e.g. [bold]/voice jarvis[/bold])",
                     title="Jarvis Neural & System Voices",
                     border_style="cyan"
                 ))
@@ -338,13 +371,15 @@ def main():
                 if len(parts) > 1:
                     try:
                         val = float(parts[1].strip())
+                        if not (0.25 <= val <= 500.0):
+                            raise ValueError("Speed out of valid range")
                         new_rate = val if val <= 3.0 else int(val)
                         voice.rate = new_rate
                         msg = f"Voice speed set to {new_rate}!"
                         console.print(f"[green]{msg}[/green]")
                         voice.speak(msg, wait=False)
                     except ValueError:
-                        console.print("[red]Please specify speed as a number (e.g., /speed 215 or /speed 1.1).[/red]")
+                        console.print("[red]Please specify a valid speed between 0.25 and 500 (e.g., /speed 1.1 or /speed 215).[/red]")
                 else:
                     console.print(f"[yellow]Current speed: {voice.rate}. Usage: /speed <number> (e.g. 215 or 1.1)[/yellow]")
                 continue
@@ -371,7 +406,7 @@ def main():
                         lines.append(f"  [dim][{d['index']}][/dim] {d['name']} ({d['outputs']} out){tag}")
 
                 mic_status = check_microphone_permission()
-                perm_str = "[green]Authorized[/green]" if mic_status == "authorized" else f"[red]{mic_status.upper()}[/red]"
+                perm_str = "[green]Authorized[/green]" if mic_status == "authorized" else f"[red]{str(mic_status).upper()}[/red]"
 
                 active_mic = f"[{voice.input_device}]" if voice.input_device is not None else "System Default"
                 content = (
@@ -383,9 +418,57 @@ def main():
                 console.print(Panel(content, title="Audio & Microphone Devices", border_style="cyan"))
                 continue
 
+            # ── AI Engine & API Key ───────────────────────────────────────────
+            elif cmd == "/engine" or cmd.startswith("/engine "):
+                from config import get_api_key
+                parts = user_input.split(maxsplit=1)
+                if len(parts) > 1:
+                    res = brain.set_engine(parts[1].strip())
+                    console.print(f"[bold green]{res}[/bold green]")
+                    voice.speak(res, wait=False)
+                else:
+                    saved = [p for p in ("gemini", "groq", "openai") if get_api_key(p)]
+                    saved_str = ", ".join(saved) if saved else "none saved yet"
+                    console.print(Panel(
+                        f"[bold white]Active AI Engine:[/bold white] [bold green]{brain.engine_label()}[/bold green]\n"
+                        f"[bold white]Saved Cloud Keys:[/bold white] {saved_str}\n\n"
+                        "Switch anytime:\n"
+                        "  [yellow]/engine gemini[/yellow] — Google Gemini 2.5 Flash (fast + vision)\n"
+                        "  [yellow]/engine groq[/yellow]   — Groq Llama 3.3 70B (ultra fast)\n"
+                        "  [yellow]/engine openai[/yellow] — OpenAI GPT-4o-mini\n"
+                        "  [yellow]/engine local[/yellow]  — 100% offline Ollama (qwen3.5:4b)\n"
+                        "  [yellow]/engine auto[/yellow]   — Cloud if key saved, else local Ollama\n\n"
+                        "Add a key securely: [yellow]/apikey gemini YOUR_KEY[/yellow]",
+                        title="AI Speed & Engine Settings",
+                        border_style="cyan",
+                    ))
+                continue
+
+            elif cmd == "/apikey" or cmd.startswith("/apikey "):
+                from config import save_secret
+                parts = user_input.split(maxsplit=2)
+                if len(parts) >= 3 and parts[1].lower() in ("gemini", "groq", "openai"):
+                    prov = parts[1].lower()
+                    key = parts[2].strip().strip("'\"")
+                    if save_secret(f"{prov}_api_key", key):
+                        masked = ("*" * max(4, len(key) - 4)) + key[-4:]
+                        msg = brain.set_engine(prov)
+                        console.print(f"[bold green]Saved {prov.upper()} API key ({masked}) safely in ~/.jarvis_secrets.json (0600).[/bold green]")
+                        console.print(f"[green]{msg}[/green]")
+                        voice.speak(f"{prov} fast mode is online and ready, sir.", wait=False)
+                    else:
+                        console.print("[red]Could not write ~/.jarvis_secrets.json.[/red]")
+                else:
+                    console.print("[yellow]Usage: /apikey <gemini|groq|openai> <YOUR_API_KEY>[/yellow]")
+                continue
+
             # ── Help ──────────────────────────────────────────────────────────
             elif cmd in ("/help", "help", "?"):
                 console.print(Panel(
+                    "[bold cyan]Security & AI Speed:[/bold cyan]\n"
+                    "  [yellow]/safe [strict|on|off][/yellow]             — lock Terminal & require Cancel/Allow popups\n"
+                    "  [yellow]/engine [gemini|groq|openai|local][/yellow] — switch between Cloud Fast Mode & Offline Ollama\n"
+                    "  [yellow]/apikey <provider> <key>[/yellow]           — save API key securely (~/.jarvis_secrets.json)\n\n"
                     "[bold cyan]Automation Commands:[/bold cyan]\n"
                     "  [yellow]/remind <time> <msg>[/yellow]  — set a timed spoken+banner reminder\n"
                     "    e.g.  /remind 5m check FFCS portal\n"

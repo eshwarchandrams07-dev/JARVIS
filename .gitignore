@@ -7,3 +7,5 @@ __pycache__/
 .jarvis_memory.json.tmp
 Jarvis_Notes.txt
 .env
+.jarvis_secrets.json
+.jarvis_models/

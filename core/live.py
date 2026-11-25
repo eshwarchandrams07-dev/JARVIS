@@ -251,7 +251,7 @@ class LiveScreenManager:
                     notify("🔴 Live Screen Sharing Active", "Jarvis is watching your screen. Press Shift+L to stop.")
                 except Exception:
                     pass
-                msg = "Live screen sharing active! I can see your screen now, boss. Ask me anything or tell me what to do!"
+                msg = "Live screen sharing is now active, sir. I have visual telemetry of your display."
                 console.print(f"\n[bold red blink]🔴 LIVE SCREEN SHARING ACTIVE:[/bold red blink] [bold white]I can see your screen in real-time![/bold white]")
                 console.print("[dim cyan]Press [bold yellow]Shift+L[/bold yellow] anywhere or type [bold yellow]/screen[/bold yellow] to stop sharing.[/dim cyan]\n")
                 self.speak(msg)
@@ -301,17 +301,17 @@ def parse_screen_watch_intent(text: str, is_screen_live: bool = False) -> tuple[
     if m_before and re.search(r'\b(?:reply|send|notify|alert|tell|open|split|run|type|click)\b', m_before.group(1), re.IGNORECASE) and not re.search(r'\b(?:watch|monitor|look at)\s+(?:my\s+|the\s+)?screen\b', m_before.group(1), re.IGNORECASE):
         raw_action = m_before.group(1).strip(" ,:.")
         raw_trig = m_before.group(2).strip(" ,:.")
-        if re.search(r'\b(something changes|screen changes|anything changes|page changes|new messages?|new notifications?|any updates?|appeared|appears)\b', raw_trig, re.IGNORECASE):
+        if re.search(r'\b(something changes|screen changes|anything changes|page changes|new messages?|new notifications?|any updates?)\b', raw_trig, re.IGNORECASE) or re.fullmatch(r'(?:it\s+)?(?:appeared|appears|changed|changes)', raw_trig, re.IGNORECASE):
             trigger = 'something changes'
         else:
-            trigger = raw_trig or 'something changes'
+            trigger = re.sub(r'\s+(?:appears|appeared|shows up|arrives|happens)(?:\s+on\s+(?:the\s+|my\s+)?screen)?\b', '', raw_trig, flags=re.IGNORECASE).strip() or 'something changes'
         return trigger, (raw_action or 'notify'), repeat
 
     # Case B: Trigger appears first ("watch screen / if new message appears, reply with done")
     if re.search(r'\b(something changes|screen changes|anything changes|page changes|new messages?|new notifications?|any updates?)\b', t, re.IGNORECASE):
         trigger = 'something changes'
     else:
-        m = re.search(r'\b(?:when|if|whenever|for|detect|see)\s+(?:(?:you|u)\s+)?(?:see\s+)?(.+?)(?:\s+(?:then|and\s+then)\s+|\s*,\s*(?=(?:notify|split|open|run|tell|alert|close|search|start|copy|reply|send|type|click)\b)|\s*:\s*|$)', t, re.IGNORECASE)
+        m = re.search(r'\b(?:every\s+time|each\s+time|when|if|whenever|for|detect|see)\s+(?:(?:you|u)\s+)?(?:see\s+)?(.+?)(?:\s+(?:then|and\s+then)\s+|\s*,\s*(?=(?:notify|split|open|run|tell|alert|close|search|start|copy|reply|send|type|click)\b)|\s*:\s*|$)', t, re.IGNORECASE)
         if m:
             trigger = m.group(1).strip()
         else:
@@ -337,6 +337,7 @@ def parse_screen_watch_intent(text: str, is_screen_live: bool = False) -> tuple[
                     action = 'notify'
 
     trigger = re.sub(r'\b(notify|alert|tell)\s+me\b.*', '', trigger, flags=re.IGNORECASE).strip()
+    trigger = re.sub(r'\s+(?:appears|appeared|shows up|arrives|happens)(?:\s+on\s+(?:the\s+|my\s+)?screen)?\b', '', trigger, flags=re.IGNORECASE).strip()
     trigger = re.sub(r'[\'\"\.,]+', '', trigger).strip()
     if not trigger:
         trigger = 'something changes'
@@ -417,6 +418,10 @@ class ScreenTriggerWatcher:
             r'TRIGGER FIRED![^\n]*',
             r'Executing requested action:[^\n]*',
             r'Follow-up action:[^\n]*',
+            r'Screen content changed!',
+            r'Visual screen change detected!',
+            r"Detected(?:\s+phrase)?\s+'[^']+'\s+on screen!",
+            r'(?:^|\n)\s*Action:\s*[^\n]*',
         ):
             cleaned = re.sub(own_phrase, '', cleaned, flags=re.IGNORECASE)
         return re.sub(r'\s+', ' ', cleaned).strip()
@@ -529,7 +534,7 @@ class ScreenTriggerWatcher:
                 has_action = bool(action and action.lower() not in ("notify", "alert", "tell me", "nothing", "none"))
                 action_failed = False
                 if has_action:
-                    self.speak(f"Boss! Trigger fired: {trigger_reason} Executing {action}!")
+                    self.speak(f"Alert, sir: {trigger_reason} Executing {action}.")
                     console.print(f"[bold green]⚙ Executing requested action:[/bold green] [bold white]{action}[/bold white]")
                     if self.brain:
                         try:
@@ -543,8 +548,12 @@ class ScreenTriggerWatcher:
                         except Exception as e:
                             console.print(f"[red]Error executing action: {e}[/red]")
                             action_failed = True
+                    else:
+                        # No brain available — treat as a failed action to prevent infinite repeat loop
+                        console.print(f"[dim yellow]No AI brain attached to screen watcher. Cannot execute '{action}'.[/dim yellow]")
+                        action_failed = True
                 else:
-                    self.speak(f"Boss! Trigger fired: {trigger_reason}")
+                    self.speak(f"Alert, sir: {trigger_reason}")
 
                 if repeat and not action_failed:
                     # Wait for banner/UI animations to settle, then snapshot a clean post-action baseline

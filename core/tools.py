@@ -50,14 +50,36 @@ def get_system_status() -> dict:
     status["timestamp"] = datetime.datetime.now().strftime("%A, %B %d, %Y at %I:%M %p")
     return status
 
+def _redact_secrets(text: str) -> str:
+    """Mask common API keys, tokens, and private keys before returning tool output to an LLM."""
+    if not text:
+        return text
+    import re as _re
+    patterns = [
+        (r'-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----', '[REDACTED_PRIVATE_KEY]'),
+        (r'\b(AIza[0-9A-Za-z\-_]{20,}|sk-[A-Za-z0-9\-_]{20,}|gsk_[A-Za-z0-9]{20,}|ghp_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9\-]{10,})\b', '[REDACTED_TOKEN]'),
+        (r'(?i)\b(api_key|secret|password|passwd|token)\s*([=:])\s*\S+', r'\1\2 [REDACTED]'),
+    ]
+    out = text
+    for pat, repl in patterns:
+        out = _re.sub(pat, repl, out)
+    return out
+
+
 def get_clipboard_content() -> str:
-    """Read the current text from the macOS clipboard."""
+    """Read the current text from the macOS clipboard (with confirmation if Strict/Cloud and secret redaction)."""
+    from config import get_safe_mode
+    mode = get_safe_mode()
+    is_cloud = _screen_watcher.brain is not None and _screen_watcher.brain.active_provider() != "ollama"
+    if mode == "strict" or (mode == "guarded" and is_cloud):
+        if not _confirm_risky_action("read macOS clipboard", "Clipboard may contain copied passwords or sensitive data."):
+            return "Action cancelled by user: clipboard was not read."
     try:
         res = subprocess.run(["pbpaste"], capture_output=True, text=True, check=False)
         content = res.stdout.strip()
         if not content:
             return "The clipboard is currently empty."
-        return content
+        return _redact_secrets(content)
     except Exception as e:
         return f"Error accessing clipboard: {e}"
 
@@ -151,6 +173,10 @@ _READONLY_CMD_PREFIXES = (
     "git status", "git log", "git diff", "which", "echo", "pmset -g",
     "sw_vers", "diskutil list", "python --version", "python3 --version",
 )
+_READONLY_EXACT_CMDS = frozenset({
+    "cat readme", "cat readme.md", "cat changelog", "cat changelog.md",
+    "cat license", "cat license.md",
+})
 
 
 def _confirm_risky_action(action_label: str, detail: str) -> bool:
@@ -178,20 +204,27 @@ def _confirm_risky_action(action_label: str, detail: str) -> bool:
 
 
 def _is_readonly_shell_command(command: str) -> bool:
-    """Return True only for simple single read-only inspection commands (no pipes/redirects/chaining)."""
+    """Return True only for simple single read-only inspection commands (no pipes/redirects/chaining/env vars)."""
     cmd = command.strip()
-    if any(op in cmd for op in (";", "&&", "||", "|", ">", "<", "`", "$(")):
+    if any(op in cmd for op in (";", "&&", "||", "|", ">", "<", "`", "$(", "$")):
         return False
-    cmd_l = cmd.lower()
-    return any(cmd_l == p or cmd_l.startswith(p + " ") for p in _READONLY_CMD_PREFIXES)
+    cmd_norm = " ".join(cmd.lower().split())
+    if cmd_norm in _READONLY_EXACT_CMDS:
+        return True
+    return any(cmd_norm == p or cmd_norm.startswith(p + " ") for p in _READONLY_CMD_PREFIXES)
 
 
 def run_shell_command(command: str) -> str:
-    """Run a safe terminal command with strict security and confirmation checks for non-readonly actions."""
+    """Run a safe terminal command respecting Safe Mode ('strict' disables shell, 'guarded' confirms writes)."""
+    from config import get_safe_mode
+    if get_safe_mode() == "strict":
+        return "Command blocked: Terminal execution is disabled in STRICT Safe Mode. Use '/safe on' or '/safe off' to allow."
+
     dangerous = [
         "rm -rf /", "rm -rf ~", "rm -rf *", "mkfs", "dd if=", ":(){ :|:& };:",
         "> /dev/sda", "chmod -R 777 /", "id_rsa", "id_ed25519", ".aws/credentials",
-        ".bash_history", ".zsh_history", ".jarvis_memory", "| bash", "| sh",
+        ".bash_history", ".zsh_history", ".jarvis_memory", ".jarvis_secrets", ".env",
+        "security find-", "| bash", "| sh",
         "/etc/passwd", "/etc/shadow", "/etc/sudoers", "pkill", "killall",
         "sudo ", "su -", "chown -R", "chmod 777", "nc -l", "ncat", "netcat",
         "curl http", "curl ftp", "wget http", "wget ftp",
@@ -207,7 +240,7 @@ def run_shell_command(command: str) -> str:
 
     try:
         res = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=10)
-        output = (res.stdout + res.stderr).strip()
+        output = _redact_secrets((res.stdout + res.stderr).strip())
         if not output:
             return f"Command executed successfully with return code {res.returncode}."
         if len(output) > 800:
@@ -221,6 +254,7 @@ def run_shell_command(command: str) -> str:
 def search_web(query: str, max_results: int = 3) -> str:
     """Search the web for real-time information, answers, and news."""
     try:
+        max_results = max(1, min(10, int(max_results)))
         try:
             from ddgs import DDGS
         except ImportError:
@@ -357,6 +391,8 @@ def control_youtube(action: str = "play_pause") -> str:
 def close_application(app_name: str) -> str:
     """Close or quit a running macOS application (e.g. 'Google Chrome', 'Safari', 'Spotify', 'Notes')."""
     import re as _re
+    if not app_name or _re.search(r'[;"\'/$`<>|&\\]', app_name):
+        return f"Invalid application name: '{app_name}'"
     safe_name = _re.sub(r"[^a-zA-Z0-9 .\-]", "", app_name).strip()
     if not safe_name:
         return f"Invalid application name: '{app_name}'"
@@ -379,10 +415,20 @@ def book_bus_redbus(source: str, destination: str, browser: str = "Google Chrome
 
 def browse_and_interact(task: str, url: str = "current", browser: str = "Google Chrome", wait_for_login: bool = False) -> str:
     """Automate actions on any website or on the currently open Chrome tab (pass url='current' to click/scroll/type/read on the active tab)."""
+    from config import get_safe_mode
+    task_l = task.lower()
+    if get_safe_mode() in ("strict", "guarded") and any(k in task_l for k in ("click", "fill", "type", "enter", "submit", "tap", "press", "reply", "send")):
+        if not _confirm_risky_action("interact with webpage", f"{url}: {task}"):
+            return f"Action cancelled by user: did not perform '{task}' on webpage."
     return _browser_controller.interactive_website_task(url=url, action_description=task, browser=browser, wait_for_login=wait_for_login)
 
 def control_app(app_name: str, action: str, details: str = "") -> str:
     """Control and automate actions in macOS applications (Spotify, Notes, Finder, Chrome/Safari, etc.)."""
+    from config import get_safe_mode
+    act_l = action.lower().strip()
+    if get_safe_mode() in ("strict", "guarded") and act_l in ("type", "keystroke", "shortcut", "press", "key", "close", "quit", "exit"):
+        if not _confirm_risky_action(f"perform '{action}' in {app_name}", details or app_name):
+            return f"Action cancelled by user: did not execute '{action}' in {app_name}."
     return _app_controller.execute_app_command(app_name=app_name, action=action, details=details)
 
 def split_screen(left_app: str, right_app: str = "Terminal") -> str:
@@ -413,7 +459,12 @@ def stop_live_session() -> str:
     return _live_manager.stop_live()
 
 def look_at_screen(question: str = "Explain what is on the screen and identify any errors or key details.") -> str:
-    """Capture a screenshot of the user's Mac display and analyze it visually using multimodal intelligence."""
+    """Capture a screenshot of the user's Mac display and analyze it visually using active Cloud/Local AI."""
+    from config import get_safe_mode
+    is_cloud = _screen_watcher.brain is not None and _screen_watcher.brain.active_provider() != "ollama"
+    if is_cloud and get_safe_mode() == "strict":
+        if not _confirm_risky_action("send screen capture to Cloud AI", f"Provider: {_screen_watcher.brain.active_provider()}"):
+            return "Action cancelled by user: screen capture not sent in Strict Safe Mode."
     from core.live import capture_screen_b64
     b64_img = capture_screen_b64(max_dimension=1024, quality=70)
 
@@ -421,29 +472,36 @@ def look_at_screen(question: str = "Explain what is on the screen and identify a
         return "Unable to capture screen. Please check Screen Recording permissions in System Settings -> Privacy & Security."
 
     try:
-        import requests
-        from config import OLLAMA_BASE_URL, MODEL_NAME
-        payload = {
-            "model": MODEL_NAME,
-            "messages": [
-                {
+        import re
+        if _screen_watcher.brain is not None and _screen_watcher.brain.active_provider() != "ollama":
+            data = _screen_watcher.brain._post_chat(
+                [{
                     "role": "user",
                     "content": f"The user asked you to inspect their screen: {question}. Provide a clear, concise visual description.",
-                    "images": [b64_img]
-                }
-            ],
-            "think": False,
-            "stream": False,
-            "options": {
-                "num_predict": 180
+                    "images": [b64_img],
+                }],
+                use_tools=False,
+                temperature=0.2,
+                num_predict=220,
+            )
+        else:
+            import requests
+            from config import OLLAMA_BASE_URL, MODEL_NAME
+            payload = {
+                "model": MODEL_NAME,
+                "messages": [{
+                    "role": "user",
+                    "content": f"The user asked you to inspect their screen: {question}. Provide a clear, concise visual description.",
+                    "images": [b64_img],
+                }],
+                "think": False,
+                "stream": False,
+                "options": {"num_predict": 180},
             }
-        }
-        resp = requests.post(f"{OLLAMA_BASE_URL}/api/chat", json=payload, timeout=60)
-        resp.raise_for_status()
-        data = resp.json()
+            resp = requests.post(f"{OLLAMA_BASE_URL}/api/chat", json=payload, timeout=60)
+            resp.raise_for_status()
+            data = resp.json()
         analysis = data.get("message", {}).get("content", "I inspected your screen but could not extract a description.")
-        # Strip thinking tags if any returned
-        import re
         clean_analysis = re.sub(r'<think>[\s\S]*?</think>', '', analysis).strip()
         return clean_analysis or analysis
     except Exception as e:
@@ -474,6 +532,11 @@ def set_reminder(message: str, duration: str) -> str:
 
 def reply_message(message: str, app_name: str = "") -> str:
     """Reply to the currently active chat in WhatsApp (Desktop or Chrome Web), Messages, Slack, or Discord."""
+    from config import get_safe_mode
+    if get_safe_mode() in ("strict", "guarded"):
+        target = app_name or "active chat"
+        if not _confirm_risky_action(f"send message in {target}", message):
+            return f"Action cancelled by user: message '{message}' was not sent."
     return _app_controller.reply_in_active_chat(message=message, app_name=app_name)
 
 # Tool registry mapping tool name to python callable
@@ -630,7 +693,8 @@ TOOL_DEFINITIONS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "The search keywords or query"}
+                    "query": {"type": "string", "description": "The search keywords or query"},
+                    "max_results": {"type": "integer", "description": "Maximum number of search results to return (1-10, default 3)"}
                 },
                 "required": ["query"]
             }
@@ -777,7 +841,7 @@ TOOL_DEFINITIONS = [
                         "description": "The playback action to perform"
                     }
                 },
-                "required": ["action"]
+                "required": []
             }
         }
     },
